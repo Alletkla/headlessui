@@ -94,6 +94,14 @@ export function useTransition(
   let inFlight = useRef(false)
   let cancelledRef = useRef(false)
 
+  // The `Closed` flag as it was last committed. State updates are not rendered
+  // synchronously, so `transition` uses this to know when the DOM reflects the
+  // flags that `run()` set.
+  let committedClosed = useRef(hasFlag(TransitionState.Closed))
+  useIsoMorphicEffect(() => {
+    committedClosed.current = hasFlag(TransitionState.Closed)
+  })
+
   let d = useDisposables()
 
   useIsoMorphicEffect(() => {
@@ -114,6 +122,8 @@ export function useTransition(
 
     return transition(element, {
       inFlight,
+      // `run()` ends with `Closed` removed when showing and added when hiding.
+      committed: () => committedClosed.current === !show,
       prepare() {
         if (cancelledRef.current) {
           // Cancelled a cancellation, we're back to the original state.
@@ -213,11 +223,13 @@ function transition(
     run,
     done,
     inFlight,
+    committed,
   }: {
     prepare: () => void
     run: () => void
     done: () => void
     inFlight: MutableRefObject<boolean>
+    committed: () => boolean
   }
 ) {
   let d = disposables()
@@ -244,11 +256,40 @@ function transition(
 
     // Wait for the transition, once the transition is complete we can cleanup.
     // We wait for a frame such that the browser has time to flush the changes
-    // to the DOM.
-    d.requestAnimationFrame(() => {
-      d.add(waitForTransition(node, done))
-    })
+    // to the DOM, and for React to have committed the state change from
+    // `run()`. Without that, a busy main thread can make us look for
+    // transitions before the one we are waiting for has started.
+    d.add(
+      waitForCommit(committed, () => {
+        d.add(waitForTransition(node, done))
+      })
+    )
   })
+
+  return d.dispose
+}
+
+// A safety net: if the state change is never committed (e.g.: the component is
+// stuck suspended), we continue as if it had been.
+const MAX_COMMIT_WAIT_MS = 2000
+
+/**
+ * Calls `callback` on the first animation frame where `committed()` is true. It
+ * always waits at least one frame.
+ */
+function waitForCommit(committed: () => boolean, callback: () => void) {
+  let d = disposables()
+  let start = performance.now()
+
+  function check() {
+    if (committed() || performance.now() - start > MAX_COMMIT_WAIT_MS) {
+      callback()
+    } else {
+      d.requestAnimationFrame(check)
+    }
+  }
+
+  d.requestAnimationFrame(check)
 
   return d.dispose
 }
